@@ -4,12 +4,27 @@ import os, requests
 app = Flask(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-@app.route("/alice", methods=["POST"])
+# Health-check Render и быстрый ручной тест
+@app.get("/")
+def root():
+    return "ok", 200
+
+@app.route("/alice", methods=["POST", "GET", "OPTIONS"])
 def alice():
-    data = request.get_json(force=True)
-    req = data.get("request", {})
-    session = data.get("session", {})
-    utter = req.get("original_utterance", "").strip()
+    # Разрешим preflight/GET, чтобы не падать 400
+    if request.method != "POST":
+        # Вернём валидный каркас, чтобы валидатор Яндекса не ругался
+        return jsonify({
+            "version": "1.0",
+            "session": {},
+            "response": {"text": "Навык на связи.", "tts": "Навык на связи.", "end_session": False}
+        })
+
+    # Мягкий парсинг JSON (silent=True: не кинет 400, если тело пустое/невалидное)
+    data = request.get_json(silent=True) or {}
+    req = data.get("request") or {}
+    session = data.get("session") or {}
+    utter = (req.get("original_utterance") or "").strip()
 
     if not utter:
         text = "Скажи, что ты хочешь спросить у GPT."
@@ -31,10 +46,11 @@ def alice():
                 },
                 timeout=15
             )
+            # Для отладки в Render → Logs
             print("STATUS:", r.status_code)
-            print("BODY:", r.text)
+            print("BODY:", r.text[:500])
             if r.status_code == 200:
-                text = r.json()["choices"][0]["message"]["content"]
+                text = (r.json()["choices"][0]["message"]["content"] or "")[:1024]
             else:
                 text = f"Ошибка OpenAI API: {r.status_code}"
         except Exception as e:
@@ -44,8 +60,5 @@ def alice():
     return jsonify({
         "version": "1.0",
         "session": session,
-        "response": {"text": text[:1024], "tts": text[:1024], "end_session": False}
+        "response": {"text": text, "tts": text, "end_session": False}
     })
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
