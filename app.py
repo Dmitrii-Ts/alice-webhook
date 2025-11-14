@@ -63,7 +63,6 @@ def ask_openai(utter: str) -> str:
         "input": utter,
         # ВАЖНО: temperature поддерживается не всеми моделями.
         # Если используешь o1 / o3 / some nano — убери эту строку.
-        "temperature": 0.2,
         "max_output_tokens": 150,  # если будет мало — просто ответ обрежется
     }
 
