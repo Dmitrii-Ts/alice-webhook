@@ -5,108 +5,129 @@ import time
 
 app = Flask(__name__)
 
-# Ключ и модель берём из переменных окружения (в Render → Environment)
+# Настройки окружения
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Можно менять модель только через переменную окружения в Render:
+# Например: gpt-5-mini, gpt-5-nano, gpt-4.1-mini, gpt-4o-mini
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# Жёсткий бюджет времени на запрос к OpenAI (чтобы уложиться в таймаут Алисы)
-HARD_DEADLINE_SEC = 9.0  # секунд
+# Жёсткий лимит по времени на запрос к OpenAI (чтобы вписаться в 8 секунд Алисы)
+HARD_DEADLINE_SEC = 4.5  # весь круг до ответа от OpenAI
+
+
+def extract_text_from_response(resp_json: dict) -> str:
+    """
+    Достаём текст из формата Responses API:
+    {
+      "output": [
+        {
+          "content": [
+            {
+              "type": "output_text" | "text",
+              "text": { "value": "Текст", ... }
+            }
+          ]
+        }
+      ]
+    }
+    """
+    output = resp_json.get("output") or resp_json.get("outputs") or []
+    if not output:
+        return ""
+
+    first_output = output[0]
+    content = first_output.get("content") or []
+    for item in content:
+        t = item.get("type")
+        if t in ("output_text", "text"):
+            text_obj = item.get("text") or {}
+            value = text_obj.get("value") or ""
+            if value:
+                return value.strip()
+
+    return ""
+
 
 def ask_openai(utter: str) -> str:
-    """Отправка запроса в OpenAI с ограничением по времени и простым ретраем."""
+    """
+    Один быстрый запрос к OpenAI Responses API без ретраев.
+    Zадача — ответить быстро и стабильно, а не идеально длинно.
+    """
     start = time.monotonic()
-    url = "https://api.openai.com/v1/chat/completions"
+
+    url = "https://api.openai.com/v1/responses"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
+
+    # ВАЖНО:
+    # - НЕ используем temperature, чтобы не ловить 400 на моделях без температуры.
+    # - НЕ используем max_tokens / max_output_tokens — только max_completion_tokens.
     payload = {
         "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": "Отвечай кратко и по сути, на русском.",
-            },
-            {
-                "role": "user",
-                "content": utter,
-            },
-        ],
-        "temperature": 0.2,
-        "max_completion_tokens": 150,
+        "input": utter,
+        "max_completion_tokens": 80,  # короткий ответ => быстрее, меньше ошибок
     }
 
-    def remaining() -> float:
-        """Сколько времени осталось до жёсткого дедлайна."""
+    def remaining():
         return HARD_DEADLINE_SEC - (time.monotonic() - start)
 
-    attempts = 2  # 1 попытка + 1 ретрай
-    for i in range(attempts):
-        left = remaining()
-        if left <= 0.2:
-            break
+    left = remaining()
+    if left <= 0.3:
+        return "Сейчас высокая нагрузка. Попробуй ещё раз."
 
-        timeout = min(5.0, max(0.2, left))  # timeout на запрос
+    timeout = min(2.5, max(0.3, left))  # максимум 2.5 секунды на OpenAI
 
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            print("STATUS:", r.status_code)
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        print("STATUS:", r.status_code)
+        print("RAW BODY:", r.text[:400])
 
-            if r.status_code == 200:
-                try:
-                    return (
-                        r.json()["choices"][0]["message"]["content"]
-                        .strip()
-                    )
-                except Exception as e:
-                    print("PARSE ERROR:", e, "BODY:", r.text[:400])
-                    return "Произошла внутренняя ошибка при разборе ответа."
+        if r.status_code == 200:
+            resp_json = r.json()
+            text = extract_text_from_response(resp_json)
+            if text:
+                return text
 
-            # rate limit / временные ошибки → один короткий ретрай
-            if r.status_code in (429, 500, 502, 503, 504) and i == 0:
-                print("TEMP ERROR:", r.status_code, "BODY:", r.text[:400])
-                backoff = min(0.7, max(0.3, remaining() - 0.5))
-                if backoff > 0.3:
-                    print("BACKOFF:", backoff, "sec")
-                    time.sleep(backoff)
-                    continue
-                # если времени мало — сразу фолбэк
-                return "Сервис перегружен. Попробуй ещё раз чуть позже."
+            # Если текст не вытащился — попробуем посмотреть статус
+            status = resp_json.get("status")
+            if status != "completed":
+                reason = (resp_json.get("incomplete_details") or {}).get("reason")
+                if reason == "max_completion_tokens":
+                    return "Ответ получился слишком длинным и был обрезан. Попробуй спросить короче."
+            return "Не удалось корректно обработать ответ от модели."
 
-            # другие коды — короткое сообщение пользователю
-            print("API ERROR:", r.status_code, r.text[:400])
-            return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
-        except Exception as e:
-            print("REQ ERROR:", e)
-            if i == 0 and remaining() > 1.0:
-                time.sleep(0.3)
-                continue
-            break
+        # Временные/лимитные ошибки — просто короткий фолбэк
+        if r.status_code in (429, 500, 502, 503, 504):
+            return "Сервис перегружен. Попробуй ещё раз через минуту."
 
-    return "Сейчас высокая нагрузка, попробуй повторить запрос через минуту."
+        # Остальное — показываем код
+        return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
+
+    except Exception as e:
+        print("REQ ERROR:", e)
+        return "Не удалось связаться с моделью. Попробуй ещё раз позже."
 
 
 @app.get("/")
-def root():
-    """Проверка живости сервиса (health-check)."""
+def health():
     return "ok", 200
 
 
 @app.route("/alice", methods=["POST", "GET", "OPTIONS"])
 def alice():
-    # Любые не-POST запросы (health-check, тесты) — не должны падать с 400
+    # GET/OPTIONS — хелсчек от Render или ручной заход из браузера
     if request.method != "POST":
-        return jsonify(
-            {
-                "version": "1.0",
-                "session": {},
-                "response": {
-                    "text": "Навык на связи.",
-                    "tts": "Навык на связи.",
-                    "end_session": False,
-                },
+        return jsonify({
+            "version": "1.0",
+            "session": {},
+            "response": {
+                "text": "Навык на связи.",
+                "tts": "Навык на связи.",
+                "end_session": False
             }
-        )
+        })
 
     data = request.get_json(silent=True) or {}
     req = data.get("request") or {}
@@ -114,25 +135,23 @@ def alice():
     utter = (req.get("original_utterance") or "").strip()
 
     if not utter:
-        text = "Скажи, что ты хочешь спросить у GPT."
+        answer = "Скажи, что ты хочешь спросить у GPT."
     else:
-        text = ask_openai(utter)
-        if not text:
-            text = "Не расслышал. Повтори, пожалуйста."
+        answer = ask_openai(utter)
+        if not answer:
+            answer = "Не расслышал, повтори, пожалуйста."
 
-    return jsonify(
-        {
-            "version": "1.0",
-            "session": session,
-            "response": {
-                "text": text[:1024],
-                "tts": text[:1024],
-                "end_session": False,
-            },
+    return jsonify({
+        "version": "1.0",
+        "session": session,
+        "response": {
+            "text": answer[:1024],
+            "tts": answer[:1024],
+            "end_session": False
         }
-    )
+    })
 
 
 if __name__ == "__main__":
-    # Локальный запуск (для отладки)
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    PORT = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=PORT)
