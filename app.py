@@ -5,19 +5,24 @@ import time
 
 app = Flask(__name__)
 
-# Настройки окружения
+# === Настройки окружения ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# Можно менять модель только через переменную окружения в Render:
-# Например: gpt-5-mini, gpt-5-nano, gpt-4.1-mini, gpt-4o-mini
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# Жёсткий лимит по времени на запрос к OpenAI (чтобы вписаться в 8 секунд Алисы)
-HARD_DEADLINE_SEC = 6.0  # весь круг до ответа от OpenAI
+# Модель лучше задавать в Render → Environment:
+#   OPENAI_MODEL = gpt-5-nano-2025-08-07
+#   или, если хочется поумнее и чуть медленнее:
+#   OPENAI_MODEL = gpt-5-mini
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+
+# Жёсткий лимит по времени на запрос к OpenAI (чтобы влезать в 8 сек Алисы)
+HARD_DEADLINE_SEC = 6.0  # весь круг внутри ask_openai (сетевой запрос + разбор)
 
 
 def extract_text_from_response(resp_json: dict) -> str:
     """
-    Достаём текст из формата Responses API:
+    Универсально достаём текст из Responses API.
+
+    Типичные структуры:
     {
       "output": [
         {
@@ -30,29 +35,61 @@ def extract_text_from_response(resp_json: dict) -> str:
         }
       ]
     }
+
+    На всякий случай делаем ещё рекурсивный поиск text.value.
     """
+
+    # 1) Прямой путь: output -> content -> text.value
     output = resp_json.get("output") or resp_json.get("outputs") or []
-    if not output:
+    if isinstance(output, list) and output:
+        for item in output:
+            content = item.get("content")
+            if isinstance(content, list):
+                for c in content:
+                    t = c.get("type")
+                    # Вариант 1: type == output_text/text + text.value
+                    if t in ("output_text", "text"):
+                        text_obj = c.get("text") or {}
+                        val = text_obj.get("value") or ""
+                        if isinstance(val, str) and val.strip():
+                            return val.strip()
+                    # Вариант 2: иногда может быть поле output_text
+                    if "output_text" in c and isinstance(c["output_text"], dict):
+                        val = c["output_text"].get("value")
+                        if isinstance(val, str) and val.strip():
+                            return val.strip()
+
+    # 2) Фолбэк: рекурсивно ищем любой dict с text.value
+    def dfs(obj):
+        if isinstance(obj, dict):
+            text_obj = obj.get("text")
+            if isinstance(text_obj, dict):
+                val = text_obj.get("value")
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            for v in obj.values():
+                res = dfs(v)
+                if res:
+                    return res
+        elif isinstance(obj, list):
+            for v in obj:
+                res = dfs(v)
+                if res:
+                    return res
         return ""
 
-    first_output = output[0]
-    content = first_output.get("content") or []
-    for item in content:
-        t = item.get("type")
-        if t in ("output_text", "text"):
-            text_obj = item.get("text") or {}
-            value = text_obj.get("value") or ""
-            if value:
-                return value.strip()
-
-    return ""
+    return dfs(resp_json) or ""
 
 
 def ask_openai(utter: str) -> str:
     """
     Один быстрый запрос к OpenAI Responses API без ретраев.
-    Zадача — ответить быстро и стабильно, а не идеально длинно.
+    Задача — ответить быстро и стабильно, а не выдавать простыню текста.
     """
+    if not OPENAI_API_KEY:
+        print("ERROR: OPENAI_API_KEY is not set")
+        return "Ключ доступа к модели не настроен. Попробуй позже."
+
     start = time.monotonic()
 
     url = "https://api.openai.com/v1/responses"
@@ -61,13 +98,13 @@ def ask_openai(utter: str) -> str:
         "Content-Type": "application/json",
     }
 
-    # ВАЖНО:
-    # - НЕ используем temperature, чтобы не ловить 400 на моделях без температуры.
-    # - НЕ используем max_tokens / max_output_tokens — только max_completion_tokens.
+    # Важно:
+    # - НЕ используем temperature (некоторые модели его не поддерживают → 400).
+    # - Используем max_output_tokens (как сказано в ошибках от API).
     payload = {
         "model": MODEL,
         "input": utter,
-         "max_output_tokens": 220,  # короткий ответ => быстрее, меньше ошибок
+        "max_output_tokens": 120,  # 120 токенов ≈ 3–5 предложений, быстро и достаточно
     }
 
     def remaining():
@@ -77,7 +114,8 @@ def ask_openai(utter: str) -> str:
     if left <= 0.3:
         return "Сейчас высокая нагрузка. Попробуй ещё раз."
 
-    timeout = min(4.0, max(0.3, left))  # максимум 2.5 секунды на OpenAI
+    # Даём модели максимум 3.5 секунды, но не выходим за жёсткий бюджет
+    timeout = min(3.5, max(0.3, left))
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
@@ -90,19 +128,19 @@ def ask_openai(utter: str) -> str:
             if text:
                 return text
 
-            # Если текст не вытащился — попробуем посмотреть статус
+            # Если текста не вытащили — проверим статус
             status = resp_json.get("status")
             if status != "completed":
                 reason = (resp_json.get("incomplete_details") or {}).get("reason")
-                if reason == "max_completion_tokens":
+                if reason == "max_output_tokens":
                     return "Ответ получился слишком длинным и был обрезан. Попробуй спросить короче."
             return "Не удалось корректно обработать ответ от модели."
 
-        # Временные/лимитные ошибки — просто короткий фолбэк
+        # Временные/лимитные ошибки — короткий фолбэк
         if r.status_code in (429, 500, 502, 503, 504):
-            return "Сервис перегружен. Попробуй ещё раз через минуту."
+            return "Сервис перегружен. Попробуй ещё раз чуть позже."
 
-        # Остальное — показываем код
+        # Любой другой код — говорим код
         return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
 
     except Exception as e:
@@ -112,12 +150,13 @@ def ask_openai(utter: str) -> str:
 
 @app.get("/")
 def health():
+    # Для UptimeRobot / Render-healthcheck
     return "ok", 200
 
 
 @app.route("/alice", methods=["POST", "GET", "OPTIONS"])
 def alice():
-    # GET/OPTIONS — хелсчек от Render или ручной заход из браузера
+    # GET/OPTIONS — хелсчек от Render/браузера/Диалогов
     if request.method != "POST":
         return jsonify({
             "version": "1.0",
@@ -153,5 +192,6 @@ def alice():
 
 
 if __name__ == "__main__":
+    # Локальный запуск (на Render используется gunicorn app:app)
     PORT = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=PORT)
