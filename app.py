@@ -67,7 +67,7 @@ def ask_openai(utter: str) -> str:
     payload = {
         "model": MODEL,
         "input": utter,
-         "max_output_tokens": 120,  # короткий ответ => быстрее, меньше ошибок
+         "max_output_tokens": 220,  # короткий ответ => быстрее, меньше ошибок
     }
 
     def remaining():
