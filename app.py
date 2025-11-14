@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 # Ключ и модель берём из переменных окружения (в Render → Environment)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1-mini")
 
 # Жёсткий бюджет времени на запрос к OpenAI (чтобы уложиться в таймаут Алисы)
 HARD_DEADLINE_SEC = 9.0  # секунд
