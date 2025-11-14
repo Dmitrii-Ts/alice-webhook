@@ -8,14 +8,15 @@ app = Flask(__name__)
 # === Настройки окружения ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Модель лучше задавать в Render → Environment:
-#   OPENAI_MODEL = gpt-5-nano-2025-08-07
-#   или, если хочется поумнее и чуть медленнее:
+# Модель задаётся в Render → Environment:
+#   OPENAI_MODEL = gpt-5-nano-2025-08-07   (очень быстро)
+#   или, если хочется поумнее:
 #   OPENAI_MODEL = gpt-5-mini
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano-2025-08-07")
 
-# Жёсткий лимит по времени на запрос к OpenAI (чтобы влезать в 8 сек Алисы)
-HARD_DEADLINE_SEC = 6.0  # весь круг внутри ask_openai (сетевой запрос + разбор)
+# Жёсткий лимит по времени на запрос к OpenAI (внутри ask_openai),
+# чтобы уложиться в таймаут Алисы.
+HARD_DEADLINE_SEC = 6.0
 
 
 def extract_text_from_response(resp_json: dict) -> str:
@@ -36,7 +37,7 @@ def extract_text_from_response(resp_json: dict) -> str:
       ]
     }
 
-    На всякий случай делаем ещё рекурсивный поиск text.value.
+    Плюс фолбэк: рекурсивно ищем любой text.value по JSON.
     """
 
     # 1) Прямой путь: output -> content -> text.value
@@ -99,12 +100,12 @@ def ask_openai(utter: str) -> str:
     }
 
     # Важно:
-    # - НЕ используем temperature (некоторые модели его не поддерживают → 400).
-    # - Используем max_output_tokens (как сказано в ошибках от API).
+    # - НЕ используем temperature (часть моделей его не поддерживает → 400).
+    # - Используем max_output_tokens (как требует Responses API).
     payload = {
         "model": MODEL,
         "input": utter,
-        "max_output_tokens": 220,  # 120 токенов ≈ 3–5 предложений, быстро и достаточно
+        "max_output_tokens": 120,  # 120 токенов ≈ 3–5 предложений
     }
 
     def remaining():
@@ -126,15 +127,18 @@ def ask_openai(utter: str) -> str:
             resp_json = r.json()
             text = extract_text_from_response(resp_json)
             if text:
+                # Даже если status == "incomplete" из-за max_output_tokens —
+                # просто отдаём то, что есть.
                 return text
 
-           return "Не удалось корректно обработать ответ от модели."
+            # Если вообще не смогли достать текст
+            return "Не удалось корректно обработать ответ от модели."
 
         # Временные/лимитные ошибки — короткий фолбэк
         if r.status_code in (429, 500, 502, 503, 504):
             return "Сервис перегружен. Попробуй ещё раз чуть позже."
 
-        # Любой другой код — говорим код
+        # Любой другой код — показываем код пользователю
         return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
 
     except Exception as e:
@@ -144,13 +148,13 @@ def ask_openai(utter: str) -> str:
 
 @app.get("/")
 def health():
-    # Для UptimeRobot / Render-healthcheck
+    # Для UptimeRobot / Render health-check
     return "ok", 200
 
 
 @app.route("/alice", methods=["POST", "GET", "OPTIONS"])
 def alice():
-    # GET/OPTIONS — хелсчек от Render/браузера/Диалогов
+    # GET/OPTIONS — health-check от Render/браузера/Диалогов
     if request.method != "POST":
         return jsonify({
             "version": "1.0",
