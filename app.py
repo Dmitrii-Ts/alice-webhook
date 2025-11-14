@@ -7,12 +7,49 @@ app = Flask(__name__)
 
 # === Настройки ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # рекомендуемая модель
-HARD_DEADLINE_SEC = 9.0  # максимальное время на запрос к OpenAI для Алисы
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # можно поменять в Render→Environment
+HARD_DEADLINE_SEC = 9.0  # максимум на запрос к OpenAI, чтобы успеть в таймаут Алисы
+
+
+def extract_text_from_response(resp_json: dict) -> str:
+    """
+    Достаём текст из формата Responses API:
+    {
+      "output": [
+        {
+          "content": [
+            {
+              "type": "output_text",
+              "text": {
+                "value": "Тут текст",
+                ...
+              }
+            }
+          ]
+        }
+      ]
+    }
+    """
+    output = resp_json.get("output") or resp_json.get("outputs") or []
+    if not output:
+        return ""
+
+    # Берём первый output
+    first_output = output[0]
+    content = first_output.get("content") or []
+    for item in content:
+        t = item.get("type")
+        if t in ("output_text", "text"):
+            text_obj = item.get("text") or {}
+            value = text_obj.get("value") or ""
+            if value:
+                return value.strip()
+
+    return ""
 
 
 def ask_openai(utter: str) -> str:
-    """Запрос к новому OpenAI Responses API."""
+    """Запрос к новому OpenAI Responses API с ограничением по времени и ретраем."""
     start = time.monotonic()
 
     url = "https://api.openai.com/v1/responses"
@@ -23,8 +60,11 @@ def ask_openai(utter: str) -> str:
 
     payload = {
         "model": MODEL,
-        "input": utter,                   # новый формат
-        "max_output_tokens": 150,         # новый параметр (замена max_tokens)
+        "input": utter,
+        # ВАЖНО: temperature поддерживается не всеми моделями.
+        # Если используешь o1 / o3 / some nano — убери эту строку.
+        "temperature": 0.2,
+        "max_output_tokens": 150,  # если будет мало — просто ответ обрежется
     }
 
     def remaining():
@@ -43,19 +83,32 @@ def ask_openai(utter: str) -> str:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
 
             print("STATUS:", r.status_code)
+            print("RAW BODY:", r.text[:500])
 
             if r.status_code == 200:
                 try:
-                    # Новый формат Responses API:
-                    output = r.json()["output_text"]
-                    return output.strip()
+                    resp_json = r.json()
+
+                    # даже если status == "incomplete" из-за max_output_tokens —
+                    # текст обычно всё равно есть в output
+                    text = extract_text_from_response(resp_json)
+                    if text:
+                        return text
+
+                    # если почему-то текста нет — пробуем дать аккуратный ответ
+                    status = resp_json.get("status")
+                    if status != "completed":
+                        reason = (resp_json.get("incomplete_details") or {}).get("reason")
+                        if reason == "max_output_tokens":
+                            return "Ответ получился слишком длинным и был обрезан. Попробуй спросить короче."
+                    return "Не удалось корректно разобрать ответ модели."
                 except Exception as e:
                     print("PARSE ERROR:", e, r.text[:300])
-                    return "Произошла ошибка при разборе ответа."
-            
+                    return "Произошла ошибка при обработке ответа от GPT."
+
             # Временные ошибки → один ретрай
             if r.status_code in (429, 500, 502, 503, 504) and i == 0:
-                print("TEMP ERROR:", r.text[:300])
+                print("TEMP ERROR:", r.status_code, r.text[:300])
                 time.sleep(0.5)
                 continue
 
@@ -80,7 +133,7 @@ def health():
 
 @app.route("/alice", methods=["POST", "GET", "OPTIONS"])
 def alice():
-    # Алиса делает GET на проверку — просто возвращаем "Навык на связи"
+    # Не-POST запросы (health-check от Render, ручной GET в браузере)
     if request.method != "POST":
         return jsonify({
             "version": "1.0",
@@ -93,8 +146,8 @@ def alice():
         })
 
     data = request.get_json(silent=True) or {}
-    req = data.get("request", {})
-    session = data.get("session", {})
+    req = data.get("request") or {}
+    session = data.get("session") or {}
     utter = (req.get("original_utterance") or "").strip()
 
     if not utter:
@@ -102,13 +155,13 @@ def alice():
     else:
         answer = ask_openai(utter)
         if not answer:
-            answer = "Не расслышал, повтори пожалуйста."
+            answer = "Не расслышал, повтори, пожалуйста."
 
     return jsonify({
         "version": "1.0",
         "session": session,
         "response": {
-            "text": answer[:1024],  # защита от лимита Алисы
+            "text": answer[:1024],
             "tts": answer[:1024],
             "end_session": False
         }
