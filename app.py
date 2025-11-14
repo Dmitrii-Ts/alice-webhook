@@ -128,13 +128,7 @@ def ask_openai(utter: str) -> str:
             if text:
                 return text
 
-            # Если текста не вытащили — проверим статус
-            status = resp_json.get("status")
-            if status != "completed":
-                reason = (resp_json.get("incomplete_details") or {}).get("reason")
-                if reason == "max_output_tokens":
-                    return "Ответ получился слишком длинным и был обрезан. Попробуй спросить короче."
-            return "Не удалось корректно обработать ответ от модели."
+           return "Не удалось корректно обработать ответ от модели."
 
         # Временные/лимитные ошибки — короткий фолбэк
         if r.status_code in (429, 500, 502, 503, 504):
