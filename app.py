@@ -33,7 +33,7 @@ def ask_openai(utter: str) -> str:
             },
         ],
         "temperature": 0.2,
-        "max_tokens": 150,
+        "max_completion_tokens": 150,
     }
 
     def remaining() -> float:
