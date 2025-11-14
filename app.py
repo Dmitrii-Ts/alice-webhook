@@ -24,7 +24,6 @@ def ask_openai(utter: str) -> str:
     payload = {
         "model": MODEL,
         "input": utter,                   # новый формат
-        "temperature": 0.2,
         "max_output_tokens": 150,         # новый параметр (замена max_tokens)
     }
 
