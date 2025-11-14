@@ -8,10 +8,11 @@ app = Flask(__name__)
 # === Настройки окружения ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Модель задаётся в Render → Environment:
-#   OPENAI_MODEL = gpt-5-nano-2025-08-07   (очень быстро)
-#   или, если хочется поумнее:
-#   OPENAI_MODEL = gpt-5-mini
+# Рекомендуется задавать модель в Render → Environment,
+# например:
+#   OPENAI_MODEL = gpt-5-nano-2025-08-07
+#   или (чуть умнее, но медленнее):
+#   OPENAI_MODEL = gpt-4.1-2025-04-14
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano-2025-08-07")
 
 # Жёсткий лимит по времени на запрос к OpenAI (внутри ask_openai),
@@ -19,73 +20,100 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano-2025-08-07")
 HARD_DEADLINE_SEC = 6.0
 
 
-def extract_text_from_response(resp_json: dict) -> str:
+def extract_text_from_response(resp_json):
     """
-    Универсально достаём текст из Responses API.
+    Универсально и безопасно достаём текст из Responses API.
 
-    Типичные структуры:
-    {
-      "output": [
-        {
-          "content": [
-            {
-              "type": "output_text" | "text",
-              "text": { "value": "Текст", ... }
-            }
-          ]
-        }
-      ]
-    }
-
-    Плюс фолбэк: рекурсивно ищем любой text.value по JSON.
+    Никаких исключений наружу не выбрасываем — максимум возвращаем "".
     """
+    try:
+        # Если вдруг это не dict, а уже строка/что-то ещё
+        if isinstance(resp_json, str):
+            return resp_json.strip()
 
-    # 1) Прямой путь: output -> content -> text.value
-    output = resp_json.get("output") or resp_json.get("outputs") or []
-    if isinstance(output, list) and output:
-        for item in output:
-            content = item.get("content")
+        if not isinstance(resp_json, dict):
+            return ""
+
+        # --- Основной путь: поле output / outputs ---
+        outputs = resp_json.get("output") or resp_json.get("outputs")
+
+        candidates = []
+        if isinstance(outputs, list):
+            candidates = outputs
+        elif isinstance(outputs, dict):
+            candidates = [outputs]
+
+        for out in candidates:
+            if not isinstance(out, dict):
+                continue
+            content = out.get("content")
             if isinstance(content, list):
-                for c in content:
-                    t = c.get("type")
-                    # Вариант 1: type == output_text/text + text.value
-                    if t in ("output_text", "text"):
-                        text_obj = c.get("text") or {}
-                        val = text_obj.get("value") or ""
-                        if isinstance(val, str) and val.strip():
-                            return val.strip()
-                    # Вариант 2: иногда может быть поле output_text
-                    if "output_text" in c and isinstance(c["output_text"], dict):
-                        val = c["output_text"].get("value")
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+
+                    # 1) классический вариант: item["text"]["value"]
+                    text_obj = item.get("text")
+                    if isinstance(text_obj, dict):
+                        val = text_obj.get("value")
                         if isinstance(val, str) and val.strip():
                             return val.strip()
 
-    # 2) Фолбэк: рекурсивно ищем любой dict с text.value
-    def dfs(obj):
-        if isinstance(obj, dict):
-            text_obj = obj.get("text")
-            if isinstance(text_obj, dict):
-                val = text_obj.get("value")
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            for v in obj.values():
-                res = dfs(v)
-                if res:
-                    return res
-        elif isinstance(obj, list):
-            for v in obj:
-                res = dfs(v)
-                if res:
-                    return res
+                    # 2) альтернативный вариант: item["output_text"]["value"]
+                    out_text_obj = item.get("output_text")
+                    if isinstance(out_text_obj, dict):
+                        val = out_text_obj.get("value")
+                        if isinstance(val, str) and val.strip():
+                            return val.strip()
+
+                    # 3) иногда бывает просто строка в content
+                    #    (на всякий случай)
+                    direct_content = item.get("content")
+                    if isinstance(direct_content, str) and direct_content.strip():
+                        return direct_content.strip()
+
+        # --- Фолбэк: рекурсивный поиск text.value или value по всему JSON ---
+
+        def dfs(obj):
+            # dict: смотрим text.value и value
+            if isinstance(obj, dict):
+                t_obj = obj.get("text")
+                if isinstance(t_obj, dict):
+                    v = t_obj.get("value")
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+
+                # некоторые структуры кладут текст прямо в value
+                v = obj.get("value")
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+
+                for v in obj.values():
+                    res = dfs(v)
+                    if res:
+                        return res
+
+            # list: обходим элементы
+            elif isinstance(obj, list):
+                for v in obj:
+                    res = dfs(v)
+                    if res:
+                        return res
+
+            # строки и всё остальное пропускаем
+            return ""
+
+        return dfs(resp_json) or ""
+    except Exception as e:
+        # Никогда не роняемся из-за парсинга
+        print("PARSE ERROR in extract_text_from_response:", repr(e))
         return ""
-
-    return dfs(resp_json) or ""
 
 
 def ask_openai(utter: str) -> str:
     """
     Один быстрый запрос к OpenAI Responses API без ретраев.
-    Задача — ответить быстро и стабильно, а не выдавать простыню текста.
+    Задача — ответить быстро и стабильно.
     """
     if not OPENAI_API_KEY:
         print("ERROR: OPENAI_API_KEY is not set")
@@ -124,7 +152,12 @@ def ask_openai(utter: str) -> str:
         print("RAW BODY:", r.text[:400])
 
         if r.status_code == 200:
-            resp_json = r.json()
+            try:
+                resp_json = r.json()
+            except Exception as e:
+                print("JSON PARSE ERROR:", repr(e))
+                return "Не удалось обработать ответ от модели."
+
             text = extract_text_from_response(resp_json)
             if text:
                 # Даже если status == "incomplete" из-за max_output_tokens —
@@ -142,7 +175,7 @@ def ask_openai(utter: str) -> str:
         return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
 
     except Exception as e:
-        print("REQ ERROR:", e)
+        print("REQ ERROR:", repr(e))
         return "Не удалось связаться с моделью. Попробуй ещё раз позже."
 
 
@@ -167,6 +200,9 @@ def alice():
         })
 
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+
     req = data.get("request") or {}
     session = data.get("session") or {}
     utter = (req.get("original_utterance") or "").strip()
