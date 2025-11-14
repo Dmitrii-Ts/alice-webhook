@@ -12,7 +12,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 # Жёсткий лимит по времени на запрос к OpenAI (чтобы вписаться в 8 секунд Алисы)
-HARD_DEADLINE_SEC = 4.5  # весь круг до ответа от OpenAI
+HARD_DEADLINE_SEC = 6.0  # весь круг до ответа от OpenAI
 
 
 def extract_text_from_response(resp_json: dict) -> str:
@@ -77,7 +77,7 @@ def ask_openai(utter: str) -> str:
     if left <= 0.3:
         return "Сейчас высокая нагрузка. Попробуй ещё раз."
 
-    timeout = min(2.5, max(0.3, left))  # максимум 2.5 секунды на OpenAI
+    timeout = min(4.0, max(0.3, left))  # максимум 2.5 секунды на OpenAI
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
