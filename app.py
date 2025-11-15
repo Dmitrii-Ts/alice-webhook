@@ -8,48 +8,33 @@ app = Flask(__name__)
 
 # Ключ и модель берём из переменных окружения (в Render → Environment)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-# Явное принудительное использование Responses API (если установлено в "1"/"true"/"yes")
-OPENAI_USE_RESPONSES = os.getenv("OPENAI_USE_RESPONSES", "").lower()
-
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # поменяйте на вашу модель, например "gpt-5-mini"
 # Жёсткий бюджет времени на запрос к OpenAI (чтобы уложиться в таймаут Алисы)
 HARD_DEADLINE_SEC = 9.0  # секунд
 
 
 def should_use_responses_api(model: str) -> bool:
     """
-    Решение, какой endpoint использовать:
-    - Если переменная OPENAI_USE_RESPONSES установлена явно (true/1/yes) — используем Responses API.
-    - Иначе делаем эвристическую проверку по имени модели (новые модели обычно содержат 'gpt-4.1', 'gpt-5', 'gpt-4o' и т.п.).
+    Простая эвристика: современные модели (gpt-4.1, gpt-5, gpt-4o и т.п.) — использовать Responses API.
     """
-    if OPENAI_USE_RESPONSES in ("1", "true", "yes"):
-        return True
-    if OPENAI_USE_RESPONSES in ("0", "false", "no"):
-        return False
-
     model_l = (model or "").lower()
-    # Ключевые слова моделей, которые, как правило, поддерживают Responses API
-    keywords = ["gpt-4.1", "gpt-5", "gpt-4o", "gpt-5-nano", "gpt-4o-mini", "gpt-4o-"]
+    if not model_l:
+        return True
+    if "gpt-3" in model_l or model_l.startswith("text-"):
+        return False
+    # модели 5-mini/5.1-mini/4.1 и т.п. — считать современными
+    keywords = ["gpt-4.1", "gpt-5", "gpt-4o", "gpt-5-mini", "gpt-5.1-mini", "gpt-5.1", "gpt-5-"]
     for k in keywords:
         if k in model_l:
             return True
-    # по умолчанию оставляем попытку использовать Responses API для современных моделей,
-    # но если модель явно старше (например, содержит "gpt-3"), не использовать.
-    if "gpt-3" in model_l or "text-" in model_l:
-        return False
-    # Default: попытаться использовать Responses API
+    # по умолчанию — использовать Responses API
     return True
 
 
 def extract_text_from_response(resp: Dict[str, Any]) -> str:
     """
-    Безопасно извлекает человекочитаемый текст из структуры ответа нового OpenAI Responses API
-    или старого формата. Поддерживает:
-      - новый формат: item['text'] = "string"
-      - старый формат: item['text'] = {'value': 'string'} или {'text': 'string'}
-    Имеется рекурсивный fallback, который ищет ключи 'text' или 'value' и возвращает первую найденную строку.
-    Никогда не бросает исключение — в крайнем случае возвращает пустую строку.
+    Универсальный извлекатель текста (поддерживает новый Responses API и старый chat/completions).
+    Возвращает пустую строку если ничего не найдено.
     """
     def extract_any_text(node: Any) -> Optional[str]:
         if node is None:
@@ -58,7 +43,6 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
             s = node.strip()
             return s if s else None
         if isinstance(node, dict):
-            # приоритетные ключи
             for key in ("text", "value", "content", "message", "body"):
                 if key in node:
                     val = node[key]
@@ -70,7 +54,6 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                         candidate = extract_any_text(val)
                         if candidate:
                             return candidate
-            # поиск во всех значениях словаря
             for v in node.values():
                 candidate = extract_any_text(v)
                 if candidate:
@@ -91,12 +74,10 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
             typ = item.get("type")
             if typ == "output_text":
                 text_field = item.get("text")
-                # новый формат: text — строка
                 if isinstance(text_field, str):
                     t = text_field.strip()
                     if t:
                         return t
-                # старый формат: text — dict с value или text
                 if isinstance(text_field, dict):
                     for k in ("value", "text"):
                         if k in text_field:
@@ -109,11 +90,9 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                                 candidate = extract_any_text(v)
                                 if candidate:
                                     return candidate
-                    # рекурсивный поиск внутри text_field
                     candidate = extract_any_text(text_field)
                     if candidate:
                         return candidate
-            # общий рекурсивный поиск (fallback)
             return extract_any_text(item)
         except Exception:
             return None
@@ -135,7 +114,6 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                 if candidate:
                     results.append(candidate)
 
-        # запасной рекурсивный проход по всему ответу, если раньше ничего не нашли
         if not results:
             candidate = extract_any_text(resp)
             if candidate:
@@ -147,51 +125,109 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
         return ""
 
 
+def parse_unsupported_params_from_message(msg: str) -> List[str]:
+    """
+    Попытаться извлечь имена неподдерживаемых параметров из текста ошибки OpenAI.
+    Пример сообщения: "Unsupported parameter: 'temperature' is not supported with this model."
+    Вернёт ['temperature'].
+    """
+    try:
+        msg_l = msg.lower()
+        keys: List[str] = []
+        # простая эвристика: искать в кавычках или после слова 'unsupported parameter'
+        if "unsupported parameter" in msg_l:
+            # найти части вида 'temperature'
+            parts = msg.split("'")
+            for p in parts:
+                pn = p.strip()
+                if pn and pn.isidentifier():
+                    keys.append(pn)
+        # также искать явные слова temperature / max_output_tokens / max_tokens
+        for candidate in ("temperature", "max_output_tokens", "max_tokens", "top_p", "presence_penalty", "frequency_penalty"):
+            if candidate in msg_l and candidate not in keys:
+                keys.append(candidate)
+        return keys
+    except Exception:
+        return []
+
+
+def try_post_with_removing_params(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float) -> requests.Response:
+    """
+    Выполнить POST, и при ошибке 400 с сообщением о неподдерживаемом параметре
+    пробовать повторно, удаляя проблемные ключи из payload (до нескольких итераций).
+    Возвращает последний Response.
+    """
+    max_retries = 3
+    tried_removed = set()
+    last_resp = None
+    for attempt in range(max_retries):
+        try:
+            last_resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except Exception:
+            # пробелы сети — сразу вернуть ошибку наружу (будет обработано в вызове)
+            raise
+        if last_resp.status_code != 400:
+            return last_resp
+        # разбор тела ошибки
+        try:
+            err = last_resp.json().get("error", {})
+            msg = err.get("message", "") or ""
+        except Exception:
+            msg = last_resp.text or ""
+        unsupported = parse_unsupported_params_from_message(msg)
+        # убрать уже удалённые или несуществующие ключи
+        unsupported = [k for k in unsupported if k and k in payload and k not in tried_removed]
+        if not unsupported:
+            # ничего понятного для удаления — вернуть текущий ответ
+            return last_resp
+        # удаляем найденные параметры и будем повторять запрос
+        for k in unsupported:
+            tried_removed.add(k)
+            payload.pop(k, None)
+            print(f"Removed unsupported parameter '{k}' from payload and retrying.")
+        # короткая пауза перед ретраем
+        time.sleep(0.05)
+    return last_resp
+
+
 def ask_openai(utter: str) -> str:
     """
-    Отправка запроса в OpenAI с ограничением по времени и простым ретраем.
-    Автоматически выбирает между /v1/responses и /v1/chat/completions в зависимости от модели
-    (или переменной OPENAI_USE_RESPONSES).
+    Отправка запроса в OpenAI. Поддерживает автоматическое определение эндпоинта.
+    Для новых моделей (например, 5-mini) при возникновении ошибок с неподдерживаемыми параметрами
+    автоматически удаляет эти параметры и повторяет запрос.
     """
     start = time.monotonic()
     use_responses = should_use_responses_api(MODEL)
 
     def remaining() -> float:
-        """Сколько времени осталось до жёсткого дедлайна."""
         return HARD_DEADLINE_SEC - (time.monotonic() - start)
 
-    attempts = 2  # 1 попытка + 1 ретрай
+    attempts = 2
     for i in range(attempts):
         left = remaining()
         if left <= 0.2:
             break
-
-        timeout = min(5.0, max(0.2, left))  # timeout на запрос
+        timeout = min(5.0, max(0.2, left))
 
         try:
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+
             if use_responses:
                 url = "https://api.openai.com/v1/responses"
-                headers = {
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                }
-                payload = {
+                # Для максимальной совместимости с различными моделями:
+                # - отправляем input как простую строку (многие модели принимают)
+                # - добавляем параметры, которые могут быть удалены при ошибке
+                payload: Dict[str, Any] = {
                     "model": MODEL,
-                    # Можно передавать "input" как строку или как список сообщений.
-                    # Для лучшей совместимости используем список сообщений.
-                    "input": [
-                        {"role": "system", "content": "Отвечай кратко и по сути, на русском."},
-                        {"role": "user", "content": utter},
-                    ],
+                    "input": utter,
                     "temperature": 0.2,
                     "max_output_tokens": 150,
                 }
             else:
                 url = "https://api.openai.com/v1/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                }
                 payload = {
                     "model": MODEL,
                     "messages": [
@@ -202,7 +238,8 @@ def ask_openai(utter: str) -> str:
                     "max_tokens": 150,
                 }
 
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            # Попытаться отправить и при необходимости удалить неподдерживаемые параметры
+            r = try_post_with_removing_params(url, headers, payload, timeout)
             print("STATUS:", r.status_code, "URL:", url)
 
             if r.status_code == 200:
@@ -212,17 +249,17 @@ def ask_openai(utter: str) -> str:
                     print("PARSE ERROR JSON:", e, "BODY:", r.text[:400])
                     return "Произошла внутренняя ошибка при разборе ответа."
 
-                # Если используем Responses API — парсим универсальной функцией
+                # Если Responses API — сначала использовать универсальный извлекатель
                 if use_responses:
                     text_from_any = extract_text_from_response(raw)
                     if text_from_any:
                         return text_from_any
-                    # Если статус явно указан и не completed — вернуть ошибку/фолбэк
+                    # если поле status есть и не completed — вернуть краткое сообщение
                     status = raw.get("status", "")
                     if status and status != "completed":
                         print("Responses API status not completed:", status)
                         return "Сервис временно недоступен. Попробуй ещё раз позже."
-                    # иначе пробуем также парсинг старого формата на всякий случай
+                    # в крайнем случае попытка посмотреть старый chat формат
                     try:
                         choices = raw.get("choices")
                         if isinstance(choices, list) and choices:
@@ -230,32 +267,24 @@ def ask_openai(utter: str) -> str:
                             content = msg.get("content")
                             if isinstance(content, str) and content.strip():
                                 return content.strip()
-                            if isinstance(content, dict):
-                                cf = extract_text_from_response({"output": [{"content": [content]}]})
-                                if cf:
-                                    return cf
                     except Exception:
                         pass
                     print("EMPTY PARSE for Responses API. RAW:", raw)
                     return "Произошла внутренняя ошибка при разборе ответа."
-
-                # Если используем старый chat completions — пробуем привычный путь
                 else:
+                    # старый chat/completions
                     try:
                         choices = raw.get("choices")
                         if isinstance(choices, list) and choices:
                             choice0 = choices[0]
-                            # новая структура: choice0.message.content
                             if isinstance(choice0.get("message"), dict):
                                 content = choice0["message"].get("content")
                                 if isinstance(content, str) and content.strip():
                                     return content.strip()
-                                # если content — dict (редко), пытаемся извлечь
                                 if isinstance(content, dict):
                                     cf = extract_text_from_response({"output": [{"content": [content]}]})
                                     if cf:
                                         return cf
-                            # старый вариант: choice0["text"]
                             if "text" in choice0 and isinstance(choice0["text"], str) and choice0["text"].strip():
                                 return choice0["text"].strip()
                     except Exception as e:
@@ -268,14 +297,13 @@ def ask_openai(utter: str) -> str:
                 print("TEMP ERROR:", r.status_code, "BODY:", r.text[:400])
                 backoff = min(0.7, max(0.3, remaining() - 0.5))
                 if backoff > 0.3:
-                    print("BACKOFF:", backoff, "sec")
                     time.sleep(backoff)
                     continue
-                # если времени мало — сразу фолбэк
                 return "Сервис перегружен. Попробуй ещё раз чуть позже."
 
-            # другие коды — короткое сообщение пользователю
+            # прочие ошибки — вывести сообщение пользователю
             print("API ERROR:", r.status_code, r.text[:400])
+            # если 400 — вернуть тело ошибки в лог и краткое сообщение пользователю
             return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
         except Exception as e:
             print("REQ ERROR:", e)
