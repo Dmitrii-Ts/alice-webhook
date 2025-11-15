@@ -21,7 +21,7 @@ OPENAI_SAVE_RAW = os.getenv("OPENAI_SAVE_RAW", "1")
 HARD_DEADLINE_SEC = float(os.getenv("HARD_DEADLINE_SEC", "9.0"))
 
 # Начальное число токенов для Responses API (можно поднять через окружение)
-BASE_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_BASE_MAX_OUTPUT_TOKENS", "300"))
+BASE_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_BASE_MAX_OUTPUT_TOKENS", "512"))
 # Максимальное значение max_output_tokens, до которого можно автоматически увеличивать при retry
 MAX_OUTPUT_TOKENS_CAP = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS_CAP", "1024"))
 
@@ -261,7 +261,6 @@ def _extract_partial_message_text(raw: Dict[str, Any]) -> Optional[str]:
         if not isinstance(outputs, list):
             outputs = [outputs]
         for out in outputs:
-            # message items содержат type == "message"
             if isinstance(out, dict) and out.get("type") == "message":
                 content = out.get("content") or []
                 if isinstance(content, list):
@@ -278,7 +277,6 @@ def _extract_partial_message_text(raw: Dict[str, Any]) -> Optional[str]:
                                 if isinstance(v, str) and v.strip():
                                     parts.append(v.strip())
                     if parts:
-                        # объединяем части (часто последняя строка может обрываться)
                         return "\n\n".join(parts).strip()
         # также проверить choices.message.content как fallback
         choices = raw.get("choices")
@@ -302,6 +300,8 @@ def ask_openai(utter: str) -> str:
     Отправка запроса в OpenAI. Для Responses API реализована авто-поправка unsupported params,
     авто-retry на incomplete==max_output_tokens (увеличиваем max_output_tokens и пробуем снова) и
     возвращение частичного assistant message если он есть (даже при статусе 'incomplete').
+    Я изменил поведение для Responses API: теперь по умолчанию отправляем input как список сообщений
+    (messages-style) — это даёт большую совместимость с моделями, которые ожидают диалогный формат.
     """
     start = time.monotonic()
     use_responses = should_use_responses_api(MODEL)
@@ -333,9 +333,13 @@ def ask_openai(utter: str) -> str:
                         return "Сервис временно недоступен. Попробуй ещё раз позже."
                     per_req_timeout = max(0.8, min(12.0, rem - 0.25))
 
+                    # --- IMPORTANT CHANGE: use messages-style input for Responses API ---
                     payload: Dict[str, Any] = {
                         "model": MODEL,
-                        "input": utter,
+                        "input": [
+                            {"role": "system", "content": "Отвечай кратко и по сути, на русском."},
+                            {"role": "user", "content": utter},
+                        ],
                         "max_output_tokens": max_output_tokens,
                         # optional params that might be removed by try_post_with_removing_params
                         "temperature": 0.2,
@@ -393,20 +397,9 @@ def ask_openai(utter: str) -> str:
                     # Если есть частичный assistant message (даже при incomplete) — вернуть его пользователю
                     partial = _extract_partial_message_text(raw)
                     if partial:
-                        # Добавим пометку, что это частичный ответ, если статус incomplete
                         status = raw.get("status", "")
-                        incomplete = raw.get("incomplete_details")
-                        reason = None
-                        try:
-                            if isinstance(incomplete, dict):
-                                reason = incomplete.get("reason")
-                        except Exception:
-                            reason = None
-                        if status == "incomplete":
-                            # Возвращаем частичный текст (чтобы пользователь не получил пустой ответ), можно пометить/усл. добавить "..." при желании
-                            return partial
-                        else:
-                            return partial
+                        # вернём частичный текст, чтобы пользователь не остался с пустым ответом
+                        return partial
 
                     # Иначе, пытаемся извлечь текст общим парсером (например, если message/assistant полностью готов)
                     text_from_any = extract_text_from_response(raw)
