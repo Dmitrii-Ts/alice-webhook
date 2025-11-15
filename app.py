@@ -17,6 +17,9 @@ OPENAI_SAVE_RAW = os.getenv("OPENAI_SAVE_RAW", "1")
 # Жёсткий бюджет времени на запрос к OpenAI (чтобы уложиться в таймаут Алисы)
 HARD_DEADLINE_SEC = 9.0  # секунд
 
+# Максимальное значение max_output_tokens, до которого можно автоматически увеличивать при retry
+MAX_OUTPUT_TOKENS_CAP = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS_CAP", "1024"))
+
 
 def should_use_responses_api(model: str) -> bool:
     model_l = (model or "").lower()
@@ -34,24 +37,19 @@ def should_use_responses_api(model: str) -> bool:
 def extract_text_from_response(resp: Dict[str, Any]) -> str:
     """
     Универсальный извлекатель текста, улучшенный фильтр для исключения служебных id'шек
-    (например rs_... ) из результата. Сначала пытается взять текст из output[].content[],
-    затем из choices/message, и только после этого делает общий рекурсивный сбор всех строк
-    и выбирает наиболее вероятную пользовательскую строку (игнорируя id-подобные строки).
-    Возвращает пустую строку, если явно полезного текста не найдено.
+    (например rs_... ) из результата.
     """
     def looks_like_id(s: str) -> bool:
         s_stripped = s.strip()
         if not s_stripped:
             return False
         s_low = s_stripped.lower()
-        # rs_... идентификаторы, длинные hex-строки и похожие шаблоны
         if re.fullmatch(r'rs_[0-9a-f]+', s_low):
             return True
         if re.fullmatch(r'resp_[0-9a-f]+', s_low):
             return True
         if re.fullmatch(r'[0-9a-f]{12,}', s_low):
             return True
-        # короткие без пробелов и без пунктуации — скорее не полезный текст
         if len(s_stripped) <= 30 and ' ' not in s_stripped and re.fullmatch(r'[\w\-]+', s_stripped):
             return True
         return False
@@ -62,22 +60,17 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
         s = s.strip()
         if not s:
             return False
-        # если встречается кириллица — явно текст на русском
         if re.search(r'[\u0400-\u04FF]', s):
             return True
-        # если есть пробелы и достаточно короткая/содержательная строка
         if ' ' in s and len(s) > 5:
             return True
-        # содержит знаки препинания (точка/вопрос/воскл), чаще человеческий текст
         if re.search(r'[.,!?…]', s) and len(s) > 3:
             return True
-        # длинная строка (примерно > 80) — скорее всего текст
         if len(s) >= 80:
             return True
         return False
 
     def extract_any_text(node: Any) -> Optional[str]:
-        """Возвращает первую найденную строку (быстрый, но не финальный выбор)."""
         if node is None:
             return None
         if isinstance(node, str):
@@ -109,7 +102,6 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
         return None
 
     def extract_all_strings(node: Any, out: List[str]) -> None:
-        """Собирает все строковые значения из JSON-структуры в список out."""
         if node is None:
             return
         if isinstance(node, str):
@@ -152,19 +144,17 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                 candidate = extract_any_text(text_field)
                 if candidate and not looks_like_id(candidate):
                     return candidate
-        # fallback для элементов content — но избегаем возвращать id-подобные строки
         candidate = extract_any_text(item)
         if candidate and not looks_like_id(candidate):
             return candidate
         return None
 
     try:
-        # 1) Сначала целенаправленно пройти output[].content[] и собрать хорошие куски
+        # 1) Сначала целенаправленно пройти output[].content[]
         results: List[str] = []
         outputs = resp.get("output") or resp.get("outputs") or resp.get("outputs_list") or []
         if not isinstance(outputs, list):
             outputs = [outputs]
-
         for out in outputs:
             if isinstance(out, dict) and "content" in out and isinstance(out["content"], list):
                 for item in out["content"]:
@@ -172,7 +162,7 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                     if text_piece:
                         results.append(text_piece)
 
-        # 2) Если ничего не нашлось в content — попытаться из choices/message (chat compat)
+        # 2) Если ничего не нашлось в content — попытаться из choices/message
         if not results:
             try:
                 choices = resp.get("choices")
@@ -183,7 +173,6 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                         if isinstance(content, str) and content.strip() and not looks_like_id(content.strip()):
                             results.append(content.strip())
                         elif isinstance(content, dict):
-                            # попробовать извлечь value/text
                             for k in ("value", "text"):
                                 if k in content and isinstance(content[k], str):
                                     val = content[k].strip()
@@ -193,23 +182,18 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
             except Exception:
                 pass
 
-        # 3) Финальный сбор всех строк и выбор наиболее вероятной пользовательской строки,
-        #    игнорируя id-подобные строки.
+        # 3) Финальный сбор всех строк и выбор наиболее вероятной строки
         if not results:
             all_strings: List[str] = []
             extract_all_strings(resp, all_strings)
-            # фильтруем id-подобные
             filtered = [s for s in all_strings if not looks_like_id(s)]
-            # из отфильтрованных выбираем наиболее вероятную: предпочтение тем, что выглядят как текст
             for s in filtered:
                 if is_likely_user_text(s):
                     results.append(s)
                     break
-            # если не найдено по heuristics — взять самую длинную не-id строку
             if not results and filtered:
                 results.append(max(filtered, key=len))
 
-        # Если ничего содержательного не найдено — вернуть пустую строку
         if not results:
             return ""
 
@@ -266,6 +250,11 @@ def try_post_with_removing_params(url: str, headers: Dict[str, str], payload: Di
 
 
 def ask_openai(utter: str) -> str:
+    """
+    Отправка запроса в OpenAI. Для Responses API реализована авто-поправка unsupported params
+    и авто-retry на incomplete==max_output_tokens (увеличиваем max_output_tokens и пробуем снова),
+    если осталось время.
+    """
     start = time.monotonic()
     use_responses = should_use_responses_api(MODEL)
 
@@ -287,13 +276,86 @@ def ask_openai(utter: str) -> str:
 
             if use_responses:
                 url = "https://api.openai.com/v1/responses"
-                payload: Dict[str, Any] = {
-                    "model": MODEL,
-                    "input": utter,
-                    "temperature": 0.2,
-                    "max_output_tokens": 150,
-                }
+                # начальное значение max_output_tokens
+                base_max_output_tokens = 150
+                max_output_tokens = base_max_output_tokens
+                # попытка сделать запрос, если incomplete по max_output_tokens — будем увеличивать и ретраять
+                while True:
+                    payload: Dict[str, Any] = {
+                        "model": MODEL,
+                        "input": utter,
+                        "max_output_tokens": max_output_tokens,
+                        # optional params that might be removed by try_post_with_removing_params
+                        "temperature": 0.2,
+                    }
+                    r = try_post_with_removing_params(url, headers, payload, timeout)
+                    print("STATUS:", r.status_code, "URL:", url, "MODEL:", MODEL, "max_output_tokens:", max_output_tokens)
+
+                    if r.status_code != 200:
+                        break  # обработка вне while
+
+                    try:
+                        raw = r.json()
+                    except Exception as e:
+                        print("PARSE ERROR JSON:", e, "BODY:", r.text[:400])
+                        return "Произошла внутренняя ошибка при разборе ответа."
+
+                    # --- DEBUG: сохранить сырой ответ для последующего анализа ---
+                    try:
+                        if str(OPENAI_SAVE_RAW).lower() in ("1", "true", "yes"):
+                            ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                            path = f"/tmp/openai_raw_{ts}.json"
+                            with open(path, "w", encoding="utf-8") as _f:
+                                json.dump(raw, _f, ensure_ascii=False, indent=2)
+                            print(f"Saved raw OpenAI response to {path}")
+                        try:
+                            print("RAW (truncated):", str(raw)[:2000])
+                        except Exception:
+                            pass
+                    except Exception as _e:
+                        print("Failed to save raw response:", _e)
+                    # --- /DEBUG ---
+
+                    # Если получили готовый ответ — попробуем извлечь текст
+                    text_from_any = extract_text_from_response(raw)
+                    if text_from_any:
+                        return text_from_any
+
+                    # Если статус incomplete и причина max_output_tokens — попробуем увеличить max_output_tokens и retry,
+                    # но только если осталось время и не превысим кап.
+                    status = raw.get("status", "")
+                    incomplete = raw.get("incomplete_details")
+                    reason = None
+                    try:
+                        if isinstance(incomplete, dict):
+                            reason = incomplete.get("reason")
+                    except Exception:
+                        reason = None
+
+                    if status == "incomplete" and reason == "max_output_tokens":
+                        # можем ли мы retry? оставшееся время и кап на токены
+                        if remaining() > 0.8 and max_output_tokens < MAX_OUTPUT_TOKENS_CAP:
+                            new_max = min(MAX_OUTPUT_TOKENS_CAP, max_output_tokens * 2)
+                            if new_max == max_output_tokens:
+                                # не можем увеличить — выходим и вернём сообщение о неполноте
+                                print("Reached max cap for max_output_tokens; not retrying.")
+                                return "Сервис временно недоступен. Попробуй ещё раз позже."
+                            print(f"Response incomplete due to max_output_tokens; retrying with max_output_tokens={new_max}")
+                            max_output_tokens = new_max
+                            # короткая пауза перед повтором
+                            time.sleep(0.05)
+                            # повторяем while
+                            continue
+                        else:
+                            print("Responses API status not completed:", status, "reason:", reason)
+                            return "Сервис временно недоступен. Попробуй ещё раз позже."
+                    # Если пришёл ответ 200, но мы не смогли извлечь текст и причина не max_output_tokens — возвращаем ошибку разбора
+                    print("EMPTY PARSE for Responses API. RAW:", raw)
+                    return "Произошла внутренняя ошибка при разборе ответа."
+
+                # если r.status_code != 200, обработка ниже (внешняя ветка)
             else:
+                # старый chat/completions путь (без auto-retry по max_output_tokens)
                 url = "https://api.openai.com/v1/chat/completions"
                 payload = {
                     "model": MODEL,
@@ -304,53 +366,14 @@ def ask_openai(utter: str) -> str:
                     "temperature": 0.2,
                     "max_tokens": 150,
                 }
-
-            r = try_post_with_removing_params(url, headers, payload, timeout)
-            print("STATUS:", r.status_code, "URL:", url)
-
-            if r.status_code == 200:
-                try:
-                    raw = r.json()
-                except Exception as e:
-                    print("PARSE ERROR JSON:", e, "BODY:", r.text[:400])
-                    return "Произошла внутренняя ошибка при разборе ответа."
-
-                # --- DEBUG: сохранить сырой ответ для последующего анализа ---
-                try:
-                    if str(OPENAI_SAVE_RAW).lower() in ("1", "true", "yes"):
-                        ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                        path = f"/tmp/openai_raw_{ts}.json"
-                        with open(path, "w", encoding="utf-8") as _f:
-                            json.dump(raw, _f, ensure_ascii=False, indent=2)
-                        print(f"Saved raw OpenAI response to {path}")
+                r = try_post_with_removing_params(url, headers, payload, timeout)
+                print("STATUS:", r.status_code, "URL:", url)
+                if r.status_code == 200:
                     try:
-                        print("RAW (truncated):", str(raw)[:2000])
-                    except Exception:
-                        pass
-                except Exception as _e:
-                    print("Failed to save raw response:", _e)
-                # --- /DEBUG ---
-
-                if use_responses:
-                    text_from_any = extract_text_from_response(raw)
-                    if text_from_any:
-                        return text_from_any
-                    status = raw.get("status", "")
-                    if status and status != "completed":
-                        print("Responses API status not completed:", status)
-                        return "Сервис временно недоступен. Попробуй ещё раз позже."
-                    try:
-                        choices = raw.get("choices")
-                        if isinstance(choices, list) and choices:
-                            msg = choices[0].get("message") or {}
-                            content = msg.get("content")
-                            if isinstance(content, str) and content.strip():
-                                return content.strip()
-                    except Exception:
-                        pass
-                    print("EMPTY PARSE for Responses API. RAW:", raw)
-                    return "Произошла внутренняя ошибка при разборе ответа."
-                else:
+                        raw = r.json()
+                    except Exception as e:
+                        print("PARSE ERROR JSON:", e, "BODY:", r.text[:400])
+                        return "Произошла внутренняя ошибка при разборе ответа."
                     try:
                         choices = raw.get("choices")
                         if isinstance(choices, list) and choices:
@@ -370,16 +393,23 @@ def ask_openai(utter: str) -> str:
                     print("EMPTY PARSE for Chat Completions. RAW:", raw)
                     return "Произошла внутренняя ошибка при разборе ответа."
 
-            if r.status_code in (429, 500, 502, 503, 504) and i == 0:
-                print("TEMP ERROR:", r.status_code, "BODY:", r.text[:400])
-                backoff = min(0.7, max(0.3, remaining() - 0.5))
-                if backoff > 0.3:
-                    time.sleep(backoff)
-                    continue
-                return "Сервис перегружен. Попробуй ещё раз чуть позже."
+            # если здесь — r был не 200 или пришла ошибка
+            # r defined in branches above for non-200 as well
+            try:
+                # if r exists and is requests.Response:
+                if r is not None and hasattr(r, "status_code"):
+                    if r.status_code in (429, 500, 502, 503, 504) and i == 0:
+                        print("TEMP ERROR:", r.status_code, "BODY:", r.text[:400])
+                        backoff = min(0.7, max(0.3, remaining() - 0.5))
+                        if backoff > 0.3:
+                            time.sleep(backoff)
+                            continue
+                        return "Сервис перегружен. Попробуй ещё раз чуть позже."
+                    print("API ERROR:", r.status_code, r.text[:400])
+                    return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
+            except Exception:
+                return "Произошла внутренняя ошибка при разборе ответа."
 
-            print("API ERROR:", r.status_code, r.text[:400])
-            return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
         except Exception as e:
             print("REQ ERROR:", e)
             if i == 0 and remaining() > 1.0:
