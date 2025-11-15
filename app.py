@@ -13,11 +13,15 @@ app = Flask(__name__)
 # Ключ и модель берём из переменных окружения (в Render → Environment)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # поменяйте на вашу модель, например "gpt-5-mini"
+
 # Включить сохранение raw-ответов в /tmp (по умолчанию включено). Поставьте "0" чтобы отключить.
 OPENAI_SAVE_RAW = os.getenv("OPENAI_SAVE_RAW", "1")
-# Жёсткий бюджет времени на запрос к OpenAI (чтобы уложиться в таймаут Алисы)
-HARD_DEADLINE_SEC = 9.0  # секунд
 
+# Жёсткий бюджет времени на запрос к OpenAI (чтобы уложиться в таймаут Алисы)
+HARD_DEADLINE_SEC = float(os.getenv("HARD_DEADLINE_SEC", "9.0"))
+
+# Начальное число токенов для Responses API (можно поднять через окружение)
+BASE_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_BASE_MAX_OUTPUT_TOKENS", "300"))
 # Максимальное значение max_output_tokens, до которого можно автоматически увеличивать при retry
 MAX_OUTPUT_TOKENS_CAP = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS_CAP", "1024"))
 
@@ -36,6 +40,10 @@ def should_use_responses_api(model: str) -> bool:
 
 
 def extract_text_from_response(resp: Dict[str, Any]) -> str:
+    """
+    Универсальный извлекатель текста, улучшенный фильтр для исключения служебных id'шек
+    (например rs_... ) из результата.
+    """
     def looks_like_id(s: str) -> bool:
         s_stripped = s.strip()
         if not s_stripped:
@@ -158,6 +166,7 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                     if text_piece:
                         results.append(text_piece)
 
+        # fallback: choices/message
         if not results:
             try:
                 choices = resp.get("choices")
@@ -190,7 +199,6 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
 
         if not results:
             return ""
-
         joined = "\n\n".join(results).strip()
         return joined
     except Exception:
@@ -243,7 +251,58 @@ def try_post_with_removing_params(url: str, headers: Dict[str, str], payload: Di
     return last_resp
 
 
+def _extract_partial_message_text(raw: Dict[str, Any]) -> Optional[str]:
+    """
+    Если модель вернула message (даже с status 'incomplete') и в message.content есть output_text —
+    вернуть это частичное содержимое (полезно, когда модель остановилась по max_output_tokens).
+    """
+    try:
+        outputs = raw.get("output") or []
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        for out in outputs:
+            # message items содержат type == "message"
+            if isinstance(out, dict) and out.get("type") == "message":
+                content = out.get("content") or []
+                if isinstance(content, list):
+                    parts: List[str] = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "output_text":
+                            tf = item.get("text")
+                            if isinstance(tf, str):
+                                s = tf.strip()
+                                if s:
+                                    parts.append(s)
+                            elif isinstance(tf, dict):
+                                v = tf.get("value") or tf.get("text")
+                                if isinstance(v, str) and v.strip():
+                                    parts.append(v.strip())
+                    if parts:
+                        # объединяем части (часто последняя строка может обрываться)
+                        return "\n\n".join(parts).strip()
+        # также проверить choices.message.content как fallback
+        choices = raw.get("choices")
+        if isinstance(choices, list) and choices:
+            choice0 = choices[0]
+            if isinstance(choice0.get("message"), dict):
+                content = choice0["message"].get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                if isinstance(content, dict):
+                    v = content.get("value") or content.get("text")
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    except Exception:
+        pass
+    return None
+
+
 def ask_openai(utter: str) -> str:
+    """
+    Отправка запроса в OpenAI. Для Responses API реализована авто-поправка unsupported params,
+    авто-retry на incomplete==max_output_tokens (увеличиваем max_output_tokens и пробуем снова) и
+    возвращение частичного assistant message если он есть (даже при статусе 'incomplete').
+    """
     start = time.monotonic()
     use_responses = should_use_responses_api(MODEL)
 
@@ -255,6 +314,7 @@ def ask_openai(utter: str) -> str:
         left = remaining()
         if left <= 0.2:
             break
+
         timeout = min(5.0, max(0.2, left))
 
         try:
@@ -265,15 +325,12 @@ def ask_openai(utter: str) -> str:
 
             if use_responses:
                 url = "https://api.openai.com/v1/responses"
-                base_max_output_tokens = 150
-                max_output_tokens = base_max_output_tokens
+                max_output_tokens = BASE_MAX_OUTPUT_TOKENS
                 while True:
-                    # перед каждой попыткой вычисляем динамический таймаут, не превышающий оставшееся время
                     rem = remaining()
                     if rem <= 0.8:
                         print("Not enough remaining time to retry (remaining:", rem, "). Aborting retries.")
                         return "Сервис временно недоступен. Попробуй ещё раз позже."
-                    # разумные границы таймаута: не меньше 0.8, не больше 12, и не больше rem - 0.25
                     per_req_timeout = max(0.8, min(12.0, rem - 0.25))
 
                     payload: Dict[str, Any] = {
@@ -286,9 +343,8 @@ def ask_openai(utter: str) -> str:
 
                     try:
                         r = try_post_with_removing_params(url, headers, payload, per_req_timeout)
-                    except req_exc.ReadTimeout as e:
+                    except req_exc.ReadTimeout:
                         print("Read timed out on attempt with max_output_tokens=", max_output_tokens, "remaining=", rem)
-                        # если осталось время и можно увеличить timeout, попробовать один короткий дополнительный запрос
                         rem2 = remaining()
                         if rem2 > 1.0:
                             per_req_timeout2 = max(0.8, min(15.0, rem2 - 0.15))
@@ -302,10 +358,10 @@ def ask_openai(utter: str) -> str:
                             return "Сервис временно недоступен. Попробуй ещё раз позже."
                     except req_exc.ConnectionError as e:
                         print("Connection error on request:", e)
-                        return "Сервис временно недоступен. Попробуй ещё раз позже."
+                        return "Сервис временно недоступен. Попробуйте позже."
                     except Exception as e:
                         print("Request error on request:", e)
-                        return "Сервис временно недоступен. Попробуй ещё раз позже."
+                        return "Сервис временно недоступен. Попробуйте позже."
 
                     print("STATUS:", r.status_code, "URL:", url, "MODEL:", MODEL, "max_output_tokens:", max_output_tokens)
 
@@ -318,7 +374,7 @@ def ask_openai(utter: str) -> str:
                         print("PARSE ERROR JSON:", e, "BODY:", r.text[:400])
                         return "Произошла внутренняя ошибка при разборе ответа."
 
-                    # debug save
+                    # --- DEBUG: сохранить сырой ответ для последующего анализа ---
                     try:
                         if str(OPENAI_SAVE_RAW).lower() in ("1", "true", "yes"):
                             ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -332,11 +388,33 @@ def ask_openai(utter: str) -> str:
                             pass
                     except Exception as _e:
                         print("Failed to save raw response:", _e)
+                    # --- /DEBUG ---
 
+                    # Если есть частичный assistant message (даже при incomplete) — вернуть его пользователю
+                    partial = _extract_partial_message_text(raw)
+                    if partial:
+                        # Добавим пометку, что это частичный ответ, если статус incomplete
+                        status = raw.get("status", "")
+                        incomplete = raw.get("incomplete_details")
+                        reason = None
+                        try:
+                            if isinstance(incomplete, dict):
+                                reason = incomplete.get("reason")
+                        except Exception:
+                            reason = None
+                        if status == "incomplete":
+                            # Возвращаем частичный текст (чтобы пользователь не получил пустой ответ), можно пометить/усл. добавить "..." при желании
+                            return partial
+                        else:
+                            return partial
+
+                    # Иначе, пытаемся извлечь текст общим парсером (например, если message/assistant полностью готов)
                     text_from_any = extract_text_from_response(raw)
                     if text_from_any:
                         return text_from_any
 
+                    # Если статус incomplete и причина max_output_tokens — попробуем увеличить max_output_tokens и retry,
+                    # но только если осталось время и не превысим кап.
                     status = raw.get("status", "")
                     incomplete = raw.get("incomplete_details")
                     reason = None
@@ -347,7 +425,6 @@ def ask_openai(utter: str) -> str:
                         reason = None
 
                     if status == "incomplete" and reason == "max_output_tokens":
-                        # retry only if we have time and haven't reached cap
                         if remaining() > 1.5 and max_output_tokens < MAX_OUTPUT_TOKENS_CAP:
                             new_max = min(MAX_OUTPUT_TOKENS_CAP, max_output_tokens * 2)
                             if new_max == max_output_tokens:
@@ -365,6 +442,7 @@ def ask_openai(utter: str) -> str:
                     return "Произошла внутренняя ошибка при разборе ответа."
 
             else:
+                # старый chat/completions путь (без auto-retry по max_output_tokens)
                 url = "https://api.openai.com/v1/chat/completions"
                 payload = {
                     "model": MODEL,
