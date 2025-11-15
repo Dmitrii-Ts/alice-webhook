@@ -2,6 +2,9 @@ from flask import Flask, request, jsonify
 import os
 import requests
 import time
+import re
+import json
+import datetime
 from typing import Any, Dict, List, Optional
 
 app = Flask(__name__)
@@ -9,34 +12,72 @@ app = Flask(__name__)
 # Ключ и модель берём из переменных окружения (в Render → Environment)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # поменяйте на вашу модель, например "gpt-5-mini"
+# Включить сохранение raw-ответов в /tmp (по умолчанию включено). Поставьте "0" чтобы отключить.
+OPENAI_SAVE_RAW = os.getenv("OPENAI_SAVE_RAW", "1")
 # Жёсткий бюджет времени на запрос к OpenAI (чтобы уложиться в таймаут Алисы)
 HARD_DEADLINE_SEC = 9.0  # секунд
 
 
 def should_use_responses_api(model: str) -> bool:
-    """
-    Простая эвристика: современные модели (gpt-4.1, gpt-5, gpt-4o и т.п.) — использовать Responses API.
-    """
     model_l = (model or "").lower()
     if not model_l:
         return True
     if "gpt-3" in model_l or model_l.startswith("text-"):
         return False
-    # модели 5-mini/5.1-mini/4.1 и т.п. — считать современными
     keywords = ["gpt-4.1", "gpt-5", "gpt-4o", "gpt-5-mini", "gpt-5.1-mini", "gpt-5.1", "gpt-5-"]
     for k in keywords:
         if k in model_l:
             return True
-    # по умолчанию — использовать Responses API
     return True
 
 
 def extract_text_from_response(resp: Dict[str, Any]) -> str:
     """
-    Универсальный извлекатель текста (поддерживает новый Responses API и старый chat/completions).
-    Возвращает пустую строку если ничего не найдено.
+    Универсальный извлекатель текста, улучшенный фильтр для исключения служебных id'шек
+    (например rs_... ) из результата. Сначала пытается взять текст из output[].content[],
+    затем из choices/message, и только после этого делает общий рекурсивный сбор всех строк
+    и выбирает наиболее вероятную пользовательскую строку (игнорируя id-подобные строки).
+    Возвращает пустую строку, если явно полезного текста не найдено.
     """
+    def looks_like_id(s: str) -> bool:
+        s_stripped = s.strip()
+        if not s_stripped:
+            return False
+        s_low = s_stripped.lower()
+        # rs_... идентификаторы, длинные hex-строки и похожие шаблоны
+        if re.fullmatch(r'rs_[0-9a-f]+', s_low):
+            return True
+        if re.fullmatch(r'resp_[0-9a-f]+', s_low):
+            return True
+        if re.fullmatch(r'[0-9a-f]{12,}', s_low):
+            return True
+        # короткие без пробелов и без пунктуации — скорее не полезный текст
+        if len(s_stripped) <= 30 and ' ' not in s_stripped and re.fullmatch(r'[\w\-]+', s_stripped):
+            return True
+        return False
+
+    def is_likely_user_text(s: str) -> bool:
+        if not s or not isinstance(s, str):
+            return False
+        s = s.strip()
+        if not s:
+            return False
+        # если встречается кириллица — явно текст на русском
+        if re.search(r'[\u0400-\u04FF]', s):
+            return True
+        # если есть пробелы и достаточно короткая/содержательная строка
+        if ' ' in s and len(s) > 5:
+            return True
+        # содержит знаки препинания (точка/вопрос/воскл), чаще человеческий текст
+        if re.search(r'[.,!?…]', s) and len(s) > 3:
+            return True
+        # длинная строка (примерно > 80) — скорее всего текст
+        if len(s) >= 80:
+            return True
+        return False
+
     def extract_any_text(node: Any) -> Optional[str]:
+        """Возвращает первую найденную строку (быстрый, но не финальный выбор)."""
         if node is None:
             return None
         if isinstance(node, str):
@@ -67,37 +108,58 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
             return None
         return None
 
+    def extract_all_strings(node: Any, out: List[str]) -> None:
+        """Собирает все строковые значения из JSON-структуры в список out."""
+        if node is None:
+            return
+        if isinstance(node, str):
+            s = node.strip()
+            if s:
+                out.append(s)
+            return
+        if isinstance(node, dict):
+            for v in node.values():
+                extract_all_strings(v, out)
+            return
+        if isinstance(node, (list, tuple)):
+            for elem in node:
+                extract_all_strings(elem, out)
+            return
+        return
+
     def extract_from_item(item: Any) -> Optional[str]:
         if not isinstance(item, dict):
             return extract_any_text(item)
-        try:
-            typ = item.get("type")
-            if typ == "output_text":
-                text_field = item.get("text")
-                if isinstance(text_field, str):
-                    t = text_field.strip()
-                    if t:
-                        return t
-                if isinstance(text_field, dict):
-                    for k in ("value", "text"):
-                        if k in text_field:
-                            v = text_field[k]
-                            if isinstance(v, str):
-                                s = v.strip()
-                                if s:
-                                    return s
-                            else:
-                                candidate = extract_any_text(v)
-                                if candidate:
-                                    return candidate
-                    candidate = extract_any_text(text_field)
-                    if candidate:
-                        return candidate
-            return extract_any_text(item)
-        except Exception:
-            return None
+        typ = item.get("type")
+        if typ == "output_text":
+            text_field = item.get("text")
+            if isinstance(text_field, str):
+                t = text_field.strip()
+                if t and not looks_like_id(t):
+                    return t
+            if isinstance(text_field, dict):
+                for k in ("value", "text"):
+                    if k in text_field:
+                        v = text_field[k]
+                        if isinstance(v, str):
+                            s = v.strip()
+                            if s and not looks_like_id(s):
+                                return s
+                        else:
+                            candidate = extract_any_text(v)
+                            if candidate and not looks_like_id(candidate):
+                                return candidate
+                candidate = extract_any_text(text_field)
+                if candidate and not looks_like_id(candidate):
+                    return candidate
+        # fallback для элементов content — но избегаем возвращать id-подобные строки
+        candidate = extract_any_text(item)
+        if candidate and not looks_like_id(candidate):
+            return candidate
+        return None
 
     try:
+        # 1) Сначала целенаправленно пройти output[].content[] и собрать хорошие куски
         results: List[str] = []
         outputs = resp.get("output") or resp.get("outputs") or resp.get("outputs_list") or []
         if not isinstance(outputs, list):
@@ -109,15 +171,47 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
                     text_piece = extract_from_item(item)
                     if text_piece:
                         results.append(text_piece)
-            else:
-                candidate = extract_any_text(out)
-                if candidate:
-                    results.append(candidate)
 
+        # 2) Если ничего не нашлось в content — попытаться из choices/message (chat compat)
         if not results:
-            candidate = extract_any_text(resp)
-            if candidate:
-                results.append(candidate)
+            try:
+                choices = resp.get("choices")
+                if isinstance(choices, list) and choices:
+                    choice0 = choices[0]
+                    if isinstance(choice0.get("message"), dict):
+                        content = choice0["message"].get("content")
+                        if isinstance(content, str) and content.strip() and not looks_like_id(content.strip()):
+                            results.append(content.strip())
+                        elif isinstance(content, dict):
+                            # попробовать извлечь value/text
+                            for k in ("value", "text"):
+                                if k in content and isinstance(content[k], str):
+                                    val = content[k].strip()
+                                    if val and not looks_like_id(val):
+                                        results.append(val)
+                                        break
+            except Exception:
+                pass
+
+        # 3) Финальный сбор всех строк и выбор наиболее вероятной пользовательской строки,
+        #    игнорируя id-подобные строки.
+        if not results:
+            all_strings: List[str] = []
+            extract_all_strings(resp, all_strings)
+            # фильтруем id-подобные
+            filtered = [s for s in all_strings if not looks_like_id(s)]
+            # из отфильтрованных выбираем наиболее вероятную: предпочтение тем, что выглядят как текст
+            for s in filtered:
+                if is_likely_user_text(s):
+                    results.append(s)
+                    break
+            # если не найдено по heuristics — взять самую длинную не-id строку
+            if not results and filtered:
+                results.append(max(filtered, key=len))
+
+        # Если ничего содержательного не найдено — вернуть пустую строку
+        if not results:
+            return ""
 
         joined = "\n\n".join(results).strip()
         return joined
@@ -126,23 +220,15 @@ def extract_text_from_response(resp: Dict[str, Any]) -> str:
 
 
 def parse_unsupported_params_from_message(msg: str) -> List[str]:
-    """
-    Попытаться извлечь имена неподдерживаемых параметров из текста ошибки OpenAI.
-    Пример сообщения: "Unsupported parameter: 'temperature' is not supported with this model."
-    Вернёт ['temperature'].
-    """
     try:
-        msg_l = msg.lower()
+        msg_l = (msg or "").lower()
         keys: List[str] = []
-        # простая эвристика: искать в кавычках или после слова 'unsupported parameter'
         if "unsupported parameter" in msg_l:
-            # найти части вида 'temperature'
             parts = msg.split("'")
             for p in parts:
                 pn = p.strip()
                 if pn and pn.isidentifier():
                     keys.append(pn)
-        # также искать явные слова temperature / max_output_tokens / max_tokens
         for candidate in ("temperature", "max_output_tokens", "max_tokens", "top_p", "presence_penalty", "frequency_penalty"):
             if candidate in msg_l and candidate not in keys:
                 keys.append(candidate)
@@ -152,11 +238,6 @@ def parse_unsupported_params_from_message(msg: str) -> List[str]:
 
 
 def try_post_with_removing_params(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float) -> requests.Response:
-    """
-    Выполнить POST, и при ошибке 400 с сообщением о неподдерживаемом параметре
-    пробовать повторно, удаляя проблемные ключи из payload (до нескольких итераций).
-    Возвращает последний Response.
-    """
     max_retries = 3
     tried_removed = set()
     last_resp = None
@@ -164,38 +245,27 @@ def try_post_with_removing_params(url: str, headers: Dict[str, str], payload: Di
         try:
             last_resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
         except Exception:
-            # пробелы сети — сразу вернуть ошибку наружу (будет обработано в вызове)
             raise
         if last_resp.status_code != 400:
             return last_resp
-        # разбор тела ошибки
         try:
             err = last_resp.json().get("error", {})
             msg = err.get("message", "") or ""
         except Exception:
             msg = last_resp.text or ""
         unsupported = parse_unsupported_params_from_message(msg)
-        # убрать уже удалённые или несуществующие ключи
         unsupported = [k for k in unsupported if k and k in payload and k not in tried_removed]
         if not unsupported:
-            # ничего понятного для удаления — вернуть текущий ответ
             return last_resp
-        # удаляем найденные параметры и будем повторять запрос
         for k in unsupported:
             tried_removed.add(k)
             payload.pop(k, None)
             print(f"Removed unsupported parameter '{k}' from payload and retrying.")
-        # короткая пауза перед ретраем
         time.sleep(0.05)
     return last_resp
 
 
 def ask_openai(utter: str) -> str:
-    """
-    Отправка запроса в OpenAI. Поддерживает автоматическое определение эндпоинта.
-    Для новых моделей (например, 5-mini) при возникновении ошибок с неподдерживаемыми параметрами
-    автоматически удаляет эти параметры и повторяет запрос.
-    """
     start = time.monotonic()
     use_responses = should_use_responses_api(MODEL)
 
@@ -217,9 +287,6 @@ def ask_openai(utter: str) -> str:
 
             if use_responses:
                 url = "https://api.openai.com/v1/responses"
-                # Для максимальной совместимости с различными моделями:
-                # - отправляем input как простую строку (многие модели принимают)
-                # - добавляем параметры, которые могут быть удалены при ошибке
                 payload: Dict[str, Any] = {
                     "model": MODEL,
                     "input": utter,
@@ -238,7 +305,6 @@ def ask_openai(utter: str) -> str:
                     "max_tokens": 150,
                 }
 
-            # Попытаться отправить и при необходимости удалить неподдерживаемые параметры
             r = try_post_with_removing_params(url, headers, payload, timeout)
             print("STATUS:", r.status_code, "URL:", url)
 
@@ -249,17 +315,30 @@ def ask_openai(utter: str) -> str:
                     print("PARSE ERROR JSON:", e, "BODY:", r.text[:400])
                     return "Произошла внутренняя ошибка при разборе ответа."
 
-                # Если Responses API — сначала использовать универсальный извлекатель
+                # --- DEBUG: сохранить сырой ответ для последующего анализа ---
+                try:
+                    if str(OPENAI_SAVE_RAW).lower() in ("1", "true", "yes"):
+                        ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                        path = f"/tmp/openai_raw_{ts}.json"
+                        with open(path, "w", encoding="utf-8") as _f:
+                            json.dump(raw, _f, ensure_ascii=False, indent=2)
+                        print(f"Saved raw OpenAI response to {path}")
+                    try:
+                        print("RAW (truncated):", str(raw)[:2000])
+                    except Exception:
+                        pass
+                except Exception as _e:
+                    print("Failed to save raw response:", _e)
+                # --- /DEBUG ---
+
                 if use_responses:
                     text_from_any = extract_text_from_response(raw)
                     if text_from_any:
                         return text_from_any
-                    # если поле status есть и не completed — вернуть краткое сообщение
                     status = raw.get("status", "")
                     if status and status != "completed":
                         print("Responses API status not completed:", status)
                         return "Сервис временно недоступен. Попробуй ещё раз позже."
-                    # в крайнем случае попытка посмотреть старый chat формат
                     try:
                         choices = raw.get("choices")
                         if isinstance(choices, list) and choices:
@@ -272,7 +351,6 @@ def ask_openai(utter: str) -> str:
                     print("EMPTY PARSE for Responses API. RAW:", raw)
                     return "Произошла внутренняя ошибка при разборе ответа."
                 else:
-                    # старый chat/completions
                     try:
                         choices = raw.get("choices")
                         if isinstance(choices, list) and choices:
@@ -292,7 +370,6 @@ def ask_openai(utter: str) -> str:
                     print("EMPTY PARSE for Chat Completions. RAW:", raw)
                     return "Произошла внутренняя ошибка при разборе ответа."
 
-            # rate limit / временные ошибки → один короткий ретрай
             if r.status_code in (429, 500, 502, 503, 504) and i == 0:
                 print("TEMP ERROR:", r.status_code, "BODY:", r.text[:400])
                 backoff = min(0.7, max(0.3, remaining() - 0.5))
@@ -301,9 +378,7 @@ def ask_openai(utter: str) -> str:
                     continue
                 return "Сервис перегружен. Попробуй ещё раз чуть позже."
 
-            # прочие ошибки — вывести сообщение пользователю
             print("API ERROR:", r.status_code, r.text[:400])
-            # если 400 — вернуть тело ошибки в лог и краткое сообщение пользователю
             return f"Сервис временно недоступен ({r.status_code}). Попробуй ещё раз позже."
         except Exception as e:
             print("REQ ERROR:", e)
@@ -317,13 +392,11 @@ def ask_openai(utter: str) -> str:
 
 @app.get("/")
 def root():
-    """Проверка живости сервиса (health-check)."""
     return "ok", 200
 
 
 @app.route("/alice", methods=["POST", "GET", "OPTIONS"])
 def alice():
-    # Любые не-POST запросы (health-check, тесты) — не должны падать с 400
     if request.method != "POST":
         return jsonify(
             {
@@ -363,5 +436,4 @@ def alice():
 
 
 if __name__ == "__main__":
-    # Локальный запуск (для отладки)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
